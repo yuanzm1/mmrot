@@ -6,6 +6,7 @@ _base_ = [
 # text_pth = '/home/yuanzm/mmdetection/weights/leak_nwpu_dsp2.pth'
 text_pth = '/home/yuanzm/mmpretrain-main/weights/leak3-nwpu_dsp.pth'
 # text_pth = False
+data_type = 'nwpu'
 NUM_CLASSES = 6+1
 angle_version = 'le90'
 model = dict(
@@ -19,7 +20,7 @@ model = dict(
         norm_cfg=dict(type='BN', requires_grad=True),
         norm_eval=True,
         style='pytorch',
-        #init_cfg=dict(type='Pretrained', checkpoint='/home/yuanzm/mmpretrain-main/weights/valid5-visual.pth', prefix='visual.')),
+        #init_cfg=dict(type='Pretrained', checkpoint='/mnt/disk2/yuanzm/weights/nwpu_ep15.pth', prefix='visual.')),
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
         type='FPN',
@@ -74,7 +75,8 @@ model = dict(
             loss_cls=dict(
                 type='CrossEntropyLoss', use_sigmoid=False, loss_weight=1.0),
             loss_bbox=dict(type='SmoothL1Loss', beta=1.0, loss_weight=1.0)),
-        text_super=text_pth),
+        text_super=text_pth,
+        dataset=data_type),
     train_cfg=dict(
         rpn=dict(
             assigner=dict(
@@ -173,4 +175,4 @@ data = dict(
 
 checkpoint_config = dict(interval=12)
 optimizer = dict(lr=0.005*bs/2) #bs2 一卡 0.005
-load_from = "/home/yuanzm/mmrotate/work_dirs/ow_oriented_rcnn_r50_fpn_1x_nwpu_le90/base2-epoch12.pth"
+# load_from = "/home/yuanzm/mmrotate/work_dirs/ow_oriented_rcnn_r50_fpn_1x_nwpu_le90/base2-epoch12.pth"

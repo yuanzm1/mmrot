@@ -72,6 +72,10 @@ class RotatedBaseDetector(BaseDetector):
             for i, bbox in enumerate(bbox_result)
         ]
         labels = np.concatenate(labels)
+        
+        # import pdb; pdb.set_trace()
+        # if not np.any(labels > 15):
+        #     return 
         # draw segmentation masks
         segms = None
         if segm_result is not None and len(labels) > 0:  # non empty

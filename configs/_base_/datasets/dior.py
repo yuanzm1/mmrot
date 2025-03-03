@@ -37,6 +37,7 @@ data = dict(
         ann_file=data_root + 'Main/trainval.txt',
         ann_subdir=data_root + 'Annotations/Oriented Bounding Boxes/',
         img_prefix=data_root + 'JPEGImages-trainval/',
+        test_all=False,
         pipeline=train_pipeline),
     val=dict(
         type=dataset_type,
@@ -47,8 +48,13 @@ data = dict(
         pipeline=test_pipeline),
     test=dict(
         type=dataset_type,
-        ann_file=data_root + 'Main/test.txt',
+        ann_file=data_root + 'Main/my_res.txt',
         ann_subdir=data_root + 'Annotations/Oriented Bounding Boxes/',
         img_prefix=data_root + 'JPEGImages-test/',
         test_all=True,
         pipeline=test_pipeline))
+
+
+        # ann_file=data_root + 'Main/trainval.txt',
+        # ann_subdir=data_root + 'Annotations/Oriented Bounding Boxes/',
+        # img_prefix=data_root + 'JPEGImages-trainval/',

@@ -80,6 +80,7 @@ def main():
     cfg = retrieve_data_cfg(args.config, args.skip_type, args.cfg_options)
 
     dataset = build_dataset(cfg.data.train)
+    # dataset = build_dataset(cfg.data.test)
 
     progress_bar = mmcv.ProgressBar(len(dataset))
 
@@ -90,7 +91,8 @@ def main():
 
         gt_bboxes = item['gt_bboxes']
         gt_labels = item['gt_labels']
-
+        
+        args.not_show = True
         imshow_det_rbboxes(
             item['img'],
             gt_bboxes,
@@ -101,7 +103,8 @@ def main():
             wait_time=args.show_interval,
             out_file=filename,
             bbox_color=dataset.PALETTE,
-            text_color=(200, 200, 200))
+            text_color=(200, 200, 200),
+            thickness=3)
 
         progress_bar.update()
 

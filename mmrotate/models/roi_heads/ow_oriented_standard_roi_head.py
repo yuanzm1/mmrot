@@ -106,7 +106,7 @@ def per_class_accuracy(a, b):
 @ROTATED_HEADS.register_module()
 class OwOrientedStandardRoIHead(RotatedStandardRoIHead):
     """Oriented RCNN roi head including one bbox head."""
-    def __init__(self,text_super=None,*args, **kwargs):
+    def __init__(self,text_super=None, dataset=None, *args, **kwargs):
         super(OwOrientedStandardRoIHead, self).__init__(*args, **kwargs)
         self.text_project = nn.Linear(1024, 1024)
         self.text_project2 = nn.ReLU()
@@ -128,7 +128,7 @@ class OwOrientedStandardRoIHead(RotatedStandardRoIHead):
         self.mkdir = False
         self.dualvae = DualVAE(1024,1024,512,64,self.bbox_head.num_classes+3)
         
-        # if self.
+        self.dataset = dataset
 
     def forward_dummy(self, x, proposals):
         """Dummy forward function.
@@ -799,7 +799,7 @@ class OwOrientedStandardRoIHead(RotatedStandardRoIHead):
             # 'helicopter', 'tennis_court',  'soccer_ball_field',  'swimming_pool']
             text_features = self.text_feature.to('cuda').transpose(0, 1)
             input_features, proposal_labels, pos_ind = self.obtain_contra_feats(trans_feature, sampling_results)
-            
+                
             # 保存对齐后的text feature
             # path = 'text_supervised_feature/text_feature_align_text0.02_mlp_from_ckpt.pth'
             # if self.train_iter % 1000 == 0:
@@ -813,9 +813,28 @@ class OwOrientedStandardRoIHead(RotatedStandardRoIHead):
             # text_feature_align = torch.cat((text_feature_align, uk_feature), dim=0)
             # proposal_labels = proposal_labels.long()
             text_feature_align = self.text_project(text_features)
-            text_feature_align = self.text_project3(self.text_project2(text_feature_align))           
+            text_feature_align = self.text_project3(self.text_project2(text_feature_align)) 
+            
+            # 正则化变换前后的text feature
+            cosine_similarities1 = torch.nn.functional.cosine_similarity(text_features.unsqueeze(1), text_features.unsqueeze(0), dim=2)
+            cosine_similarities2 = torch.nn.functional.cosine_similarity(text_feature_align.unsqueeze(1), text_feature_align.unsqueeze(0), dim=2)
+            sum_abs_diff = F.l1_loss(cosine_similarities1, cosine_similarities2, reduction='mean') 
+            
+            def normalized_l2_distance(a, b):
+                # 对向量 a 进行归一化
+                normalized_a = a / torch.norm(a, p=2)
+                # 对向量 b 进行归一化
+                normalized_b = b / torch.norm(b, p=2)
+                # 计算归一化后向量的差值
+                diff = normalized_a - normalized_b
+                # 计算差值向量的 L2 范数，即归一化后的 L2 距离
+                return torch.norm(diff, p=2)
+            sum_distance = normalized_l2_distance(text_feature_align, text_features)
+            # pdb.set_trace()
+                     
             text_feature_align = text_feature_align[:self.num_classes - 1, :]
             keep = torch.where(proposal_labels != self.num_classes - 1)[0]
+            uk_input_features = input_features[~keep]
             input_features = input_features[keep]
             proposal_labels = proposal_labels[keep].long()
             input_features = F.normalize(input_features, dim=1)
@@ -831,9 +850,85 @@ class OwOrientedStandardRoIHead(RotatedStandardRoIHead):
                         a,
                         avg_factor=proposal_labels.shape[0],
                         reduction_override=None) * 0.02
+
+            # loss_text += sum_abs_diff * 4
             # if res.shape[0] > 0 and (not (0 <= loss_text <=10)):
             #     print(res)
             # loss_text = self.clstr_loss_l2_cdist_new(input_features, proposals)
+            
+            # 定义对比学习损失函数（InfoNCE 损失）
+
+            def info_nce_loss(image_features, labels, device, temperature=0.07, eps=1e-8):
+                """
+                image_features: Tensor of shape [batch_size, feature_dim]
+                labels: Tensor of shape [batch_size]
+                temperature: 温度系数，控制相似度分布的平滑程度
+                eps: 极小值，防止数值计算错误（如log(0)）
+                """
+                batch_size = image_features.shape[0]
+                
+                # 1. 特征归一化（余弦相似度）
+                image_features = F.normalize(image_features, dim=1)
+                
+                # 2. 计算相似度矩阵（余弦相似度）
+                similarity_matrix = torch.matmul(image_features, image_features.T)  # [batch_size, batch_size]
+                
+                # 3. 构造正样本掩码（同类且排除自身）
+                labels = labels.contiguous().view(-1, 1)
+                mask = torch.eq(labels, labels.T).float().to(device=device)  # [batch_size, batch_size]
+                mask.fill_diagonal_(0)  # 排除自身
+                
+                # 4. 计算分子：正样本的指数相似度和
+                positives = torch.sum(torch.exp(similarity_matrix / temperature) * mask, dim=1)  # [batch_size]
+                
+                # 5. 计算分母：所有样本的指数相似度和（排除自身）
+                negatives = torch.sum(torch.exp(similarity_matrix / temperature), dim=1) - torch.exp(similarity_matrix.diag() / temperature)
+                
+                # 6. 处理无正样本的情况（避免除以零）
+                positives_count = mask.sum(dim=1)  # 每个样本的正样本数 [batch_size]
+                valid_indices = positives_count > 0  # 有效样本的掩码
+                
+                # 7. 计算每个样本的损失（仅对有效样本）
+                loss_per_sample = torch.zeros(batch_size, device=image_features.device)
+                if valid_indices.sum() > 0:
+                    # 添加极小值eps防止log(0)
+                    loss_valid = -torch.log((positives[valid_indices] + eps) / (negatives[valid_indices] + eps))
+                    loss_per_sample[valid_indices] = loss_valid / positives_count[valid_indices]
+                
+                # 8. 平均所有有效样本的损失
+                total_loss = loss_per_sample.sum() / (valid_indices.sum() + eps)
+                return total_loss
+
+            # 从文本特征中选取前 n_clusters 个向量作为初始聚类中心
+            n_clusters = 5
+            if uk_input_features.shape[0] >= n_clusters:
+                selected_centroids = text_features[-n_clusters+1:]
+                # 进行 K-Means 聚类，使用文本特征作为初始聚类中心
+                image_features_np = uk_input_features.detach().cpu().numpy()
+                # 生成一个距离足够远的随机向量
+                num_trials = 100  # 尝试次数
+                max_total_distance = -1
+                best_random_vector = None
+                for _ in range(num_trials):
+                    random_vector = torch.randn(1, image_features_np.shape[-1], device=text_features.device)
+                    total_distance = 0
+                    for centroid in selected_centroids:
+                        distance = torch.norm(random_vector - centroid)
+                        total_distance += distance
+                    if total_distance > max_total_distance:
+                        max_total_distance = total_distance
+                        best_random_vector = random_vector
+                # 合并选择的向量和随机向量
+                initial_centroids = torch.cat([selected_centroids, best_random_vector], dim=0).detach().cpu().numpy()
+                kmeans = KMeans(n_clusters=n_clusters, init=initial_centroids, n_init=1)
+                cluster_labels = kmeans.fit_predict(image_features_np)
+                cluster_labels = torch.tensor(cluster_labels, device=text_feature_align.device)
+                # pdb.set_trace()
+                loss_nce = info_nce_loss(uk_input_features, cluster_labels, text_feature_align.device)
+                # pdb.set_trace()
+            else:
+                loss_nce = torch.tensor(0, device=text_feature_align.device)
+            #pdb.set_trace()
             
             def cal_loss_vae(input_features,proposal_labels, device):
                 x_visual = input_features
@@ -869,7 +964,11 @@ class OwOrientedStandardRoIHead(RotatedStandardRoIHead):
             
         if self.train_cfg.assigner['text_super'] and res.shape[0] > 0:
             loss_bbox['loss_text'] = loss_text
+            loss_bbox['loss_nce'] = loss_nce * 1.0
+            # loss_bbox['loss_diff'] = sum_abs_diff * 4
+            # loss_bbox['loss_distan'] = sum_distance * 0.5
             # loss_bbox['loss_vae'] = loss_vae * 0.01
+        # pdb.set_trace()
         self.train_iter += 1         # iter 数量增加
         bbox_results.update(loss_bbox=loss_bbox)
 
@@ -910,86 +1009,89 @@ class OwOrientedStandardRoIHead(RotatedStandardRoIHead):
         cls_score2 = cls_score
         
         # # # DIORDataset 16+4
-        # # # self.text_feature = torch.load(self.text_super).transpose(0, 1)
-        # self.text_feature = torch.load("/mnt/disk2/yuanzm/weights/valid5-dior_aug.pth").transpose(0, 1)
-        # text_feature = self.text_feature.to('cuda').transpose(0, 1)
-        # # text_feature_align = text_feature
-        # text_feature_align = self.text_project(text_feature)
-        # text_feature_align = self.text_project3(self.text_project2(text_feature_align))
-        # input_features = F.normalize(bbox_results['trans_feature'], dim=1)
-        # text_feature_align = F.normalize(text_feature_align, dim=1)
-        # res = torch.matmul(input_features, text_feature_align.transpose(-1, -2))
-        # accs, counts = per_class_accuracy(cls_score, res)
-        # self.accum_acc += accs
-        # self.accum_cnt += counts
-        # self.num_iter += 1
-        # softmax_layer = nn.Softmax(dim = 1)
-        # unknown_res = softmax_layer(res[:,16:])
-        # # max_u_idx = torch.arange(cls_score.shape[0])[torch.argmax(cls_score, dim=1)==16]
-        # # print(unknown_res[max_u_idx,:])
-        # max_idx_res = torch.argmax(unknown_res, dim = 1)
-        # cls_score2 = torch.zeros([cls_score.shape[0], 21]).to('cuda')
-        # cls_score2[:,:16] =  cls_score[:,:16]
-        # cls_score2[torch.arange(cls_score.shape[0]), max_idx_res + 16] = cls_score[:, 16]
-        # cls_score2[:,-1] =  cls_score[:,17]
-        # self.bbox_head.num_classes = 20
+        if self.dataset == 'dior':
+            # # self.text_feature = torch.load(self.text_super).transpose(0, 1)
+            self.text_feature = torch.load("/mnt/disk2/yuanzm/weights/valid5-dior_aug.pth").transpose(0, 1)
+            text_feature = self.text_feature.to('cuda').transpose(0, 1)
+            # text_feature_align = text_feature
+            text_feature_align = self.text_project(text_feature)
+            text_feature_align = self.text_project3(self.text_project2(text_feature_align))
+            input_features = F.normalize(bbox_results['trans_feature'], dim=1)
+            text_feature_align = F.normalize(text_feature_align, dim=1)
+            res = torch.matmul(input_features, text_feature_align.transpose(-1, -2))
+            accs, counts = per_class_accuracy(cls_score, res)
+            self.accum_acc += accs
+            self.accum_cnt += counts
+            self.num_iter += 1
+            softmax_layer = nn.Softmax(dim = 1)
+            unknown_res = softmax_layer(res[:,16:])
+            # max_u_idx = torch.arange(cls_score.shape[0])[torch.argmax(cls_score, dim=1)==16]
+            # print(unknown_res[max_u_idx,:])
+            max_idx_res = torch.argmax(unknown_res, dim = 1)
+            cls_score2 = torch.zeros([cls_score.shape[0], 21]).to('cuda')
+            cls_score2[:,:16] =  cls_score[:,:16]
+            cls_score2[torch.arange(cls_score.shape[0]), max_idx_res + 16] = cls_score[:, 16]
+            cls_score2[:,-1] =  cls_score[:,17]
+            self.bbox_head.num_classes = 20
 
-        # NWPUDataset 6+4
-        self.text_feature = torch.load(self.text_super).transpose(0, 1) #valid5-dota_dsp
-        text_feature = self.text_feature.to('cuda').transpose(0, 1)
-        # cos sim测试方法
-        text_feature_align = self.text_project(text_feature)
-        text_feature_align = self.text_project3(self.text_project2(text_feature_align))
-        input_features = F.normalize(bbox_results['trans_feature'], dim=1)
-        text_feature_align = F.normalize(text_feature_align, dim=1)
-        res = torch.matmul(input_features, text_feature_align.transpose(-1, -2))
-        softmax_layer = nn.Softmax(dim = 1)
-        unknown_res = softmax_layer(res[:,6:])
-        # accs, counts = per_class_accuracy(cls_score, res)
-        # self.accum_acc += accs
-        # self.accum_cnt += counts
-        # self.num_iter += 1
-        max_idx_res = torch.argmax(unknown_res, dim = 1)
-        cls_score2 = torch.zeros([cls_score.shape[0], 11]).to('cuda')
-        cls_score2[:,:6] =  cls_score[:,:6]
-        cls_score2[torch.arange(cls_score.shape[0]), max_idx_res + 6] = cls_score[:, 6]
-        cls_score2[:,10] =  cls_score[:,7]
-        self.bbox_head.num_classes = 10
+        # # NWPUDataset 6+4
+        if self.dataset == 'nwpu':
+            self.text_feature = torch.load(self.text_super).transpose(0, 1) #valid5-dota_dsp
+            text_feature = self.text_feature.to('cuda').transpose(0, 1)
+            # cos sim测试方法
+            text_feature_align = self.text_project(text_feature)
+            text_feature_align = self.text_project3(self.text_project2(text_feature_align))
+            input_features = F.normalize(bbox_results['trans_feature'], dim=1)
+            text_feature_align = F.normalize(text_feature_align, dim=1)
+            res = torch.matmul(input_features, text_feature_align.transpose(-1, -2))
+            softmax_layer = nn.Softmax(dim = 1)
+            unknown_res = softmax_layer(res[:,6:])
+            # accs, counts = per_class_accuracy(cls_score, res)
+            # self.accum_acc += accs
+            # self.accum_cnt += counts
+            # self.num_iter += 1
+            max_idx_res = torch.argmax(unknown_res, dim = 1)
+            cls_score2 = torch.zeros([cls_score.shape[0], 11]).to('cuda')
+            cls_score2[:,:6] =  cls_score[:,:6]
+            cls_score2[torch.arange(cls_score.shape[0]), max_idx_res + 6] = cls_score[:, 6]
+            cls_score2[:,10] =  cls_score[:,7]
+            self.bbox_head.num_classes = 10
 
-        # # DOTADataset 11+4
-        # self.text_feature = torch.load(self.text_super).transpose(0, 1) #valid5-dota_dsp
-        # text_feature = self.text_feature.to('cuda').transpose(0, 1)
-        # # # cos sim测试方法
-        # # text_feature_align = self.text_project(text_feature)
-        # # text_feature_align = self.text_project3(self.text_project2(text_feature_align))
-        # # # text_feature_align = text_feature
-        # # # input_features = self.img_project(bbox_results['trans_feature'])
-        # # # input_features = self.img_project3(self.img_project2(input_features))
-        # # input_features = F.normalize(bbox_results['trans_feature'], dim=1)
-        # # text_feature_align = F.normalize(text_feature_align, dim=1)
-        # # vae测试方法
-        # self.dualvae.reparameterize_with_noise = False
-        # input_features, text_feature_align = self.dualvae(bbox_results['trans_feature'], text_feature)
-        # self.dualvae.reparameterize_with_noise = True
-        # res = torch.matmul(input_features, text_feature_align.transpose(-1, -2))
-        # softmax_layer = nn.Softmax(dim = 1)
-        # unknown_res = softmax_layer(res[:,11:])
-        # # accs, counts = per_class_accuracy(cls_score, res)
-        # # self.accum_acc += accs
-        # # self.accum_cnt += counts
-        # # self.num_iter += 1
-        # # max_u_idx = torch.arange(cls_score.shape[0])[torch.argmax(cls_score, dim=1)==11]
-        # # print(unknown_res[max_u_idx,:])
-        # max_idx_res = torch.argmax(unknown_res, dim = 1)
-        # range_scores = torch.max(unknown_res, dim=1).values - torch.min(unknown_res, dim=1).values 
-        # # idx_list = torch.where(range_scores <= 0.015)[0]
-        # # max_idx_res[idx_list] = -1
-        # #pdb.set_trace()
-        # cls_score2 = torch.zeros([cls_score.shape[0], 16]).to('cuda')
-        # cls_score2[:,:11] =  cls_score[:,:11]
-        # cls_score2[torch.arange(cls_score.shape[0]), max_idx_res + 11] = cls_score[:, 11]
-        # cls_score2[:,15] =  cls_score[:,12]
-        # self.bbox_head.num_classes = 15
+        # DOTADataset 11+4
+        if self.dataset == 'dota':
+            self.text_feature = torch.load(self.text_super).transpose(0, 1) #valid5-dota_dsp
+            text_feature = self.text_feature.to('cuda').transpose(0, 1)
+            # # cos sim测试方法
+            text_feature_align = self.text_project(text_feature)
+            text_feature_align = self.text_project3(self.text_project2(text_feature_align))
+            # text_feature_align = text_feature
+            # input_features = self.img_project(bbox_results['trans_feature'])
+            # input_features = self.img_project3(self.img_project2(input_features))
+            input_features = F.normalize(bbox_results['trans_feature'], dim=1)
+            text_feature_align = F.normalize(text_feature_align, dim=1)
+            # vae测试方法
+            # self.dualvae.reparameterize_with_noise = False
+            # input_features, text_feature_align = self.dualvae(bbox_results['trans_feature'], text_feature)
+            # self.dualvae.reparameterize_with_noise = True
+            res = torch.matmul(input_features, text_feature_align.transpose(-1, -2))
+            softmax_layer = nn.Softmax(dim = 1)
+            unknown_res = softmax_layer(res[:,11:])
+            # accs, counts = per_class_accuracy(cls_score, res)
+            # self.accum_acc += accs
+            # self.accum_cnt += counts
+            # self.num_iter += 1
+            # max_u_idx = torch.arange(cls_score.shape[0])[torch.argmax(cls_score, dim=1)==11]
+            # print(unknown_res[max_u_idx,:])
+            max_idx_res = torch.argmax(unknown_res, dim = 1)
+            range_scores = torch.max(unknown_res, dim=1).values - torch.min(unknown_res, dim=1).values 
+            # idx_list = torch.where(range_scores <= 0.015)[0]
+            # max_idx_res[idx_list] = -1
+            #pdb.set_trace()
+            cls_score2 = torch.zeros([cls_score.shape[0], 16]).to('cuda')
+            cls_score2[:,:11] =  cls_score[:,:11]
+            cls_score2[torch.arange(cls_score.shape[0]), max_idx_res + 11] = cls_score[:, 11]
+            cls_score2[:,15] =  cls_score[:,12]
+            self.bbox_head.num_classes = 15
         
         bbox_pred = bbox_results['bbox_pred']
         num_proposals_per_img = tuple(len(p) for p in proposals)
@@ -1059,6 +1161,7 @@ class OwOrientedStandardRoIHead(RotatedStandardRoIHead):
                          self.bbox_head.num_classes)
             for i in range(len(det_bboxes))
         ]
-        self.bbox_head.num_classes -= 3
+        if self.dataset:
+            self.bbox_head.num_classes -= 3
         return bbox_results
 

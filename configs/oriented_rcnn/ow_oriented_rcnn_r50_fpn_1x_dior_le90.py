@@ -4,6 +4,7 @@ _base_ = [
 ]
 
 NUM_CLASSES = 16+1
+data_type = 'dior'
 angle_version = 'le90'
 model = dict(
     type='OrientedRCNN',
@@ -70,7 +71,8 @@ model = dict(
             reg_class_agnostic=True,
             loss_cls=dict(
                 type='CrossEntropyLoss', use_sigmoid=False, loss_weight=1.0),
-            loss_bbox=dict(type='SmoothL1Loss', beta=1.0, loss_weight=1.0))),
+            loss_bbox=dict(type='SmoothL1Loss', beta=1.0, loss_weight=1.0)),
+        dataset=data_type),
     train_cfg=dict(
         rpn=dict(
             assigner=dict(
@@ -162,4 +164,13 @@ data = dict(
     test=dict(version=angle_version))
 
 optimizer = dict(lr=0.005*bs/2) #bs2 一卡 0.005
-load_from = "/mnt/disk2/yuanzm/weights/valid5-epoch12.pth"
+# load_from = "/mnt/disk2/yuanzm/weights/valid5-epoch12.pth"
+
+# lr_config = dict(
+#     policy='step',
+#     warmup='linear',
+#     warmup_iters=500,
+#     warmup_ratio=1.0 / 3,
+#     step=[1, 2])
+# runner = dict(type='EpochBasedRunner', max_epochs=3)
+# checkpoint_config = dict(interval=3)
