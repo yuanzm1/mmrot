@@ -6,7 +6,8 @@ _base_ = [
 #text_pth = "/mnt/disk2/yuanzm/weights/leak4-dota_dsp.pth"
 # text_pth = "/home/yuanzm/mmpretrain-main/weights/rmc_dota_dsp2.pth"
 #text_pth = '/home/yuanzm/mmdetection/weights/rmc_dota_dsp2.pth'
-text_pth = "/home/yuanzm/mmpretrain-main/weights/leak4-dota_dsp2.pth"
+text_pth = "/home/yuanzm/mmpretrain-main/weights/leak3-dota_dsp2.pth"
+data_type = None #'dota'
 # text_pth = None
 NUM_CLASSES = 11 + 1
 angle_version = 'le90'
@@ -21,8 +22,8 @@ model = dict(
         norm_cfg=dict(type='BN', requires_grad=True),
         norm_eval=True,
         style='pytorch',
-        # init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
-        init_cfg=dict(type='Pretrained', checkpoint='/home/yuanzm/mmpretrain-main/weights/leak4-dota-vis.pth', prefix='visual.')),
+        init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
+        # init_cfg=dict(type='Pretrained', checkpoint='/home/yuanzm/mmpretrain-main/weights/leak4-dota-vis.pth', prefix='visual.')),
     neck=dict(
         type='FPN',
         in_channels=[256, 512, 1024, 2048],
@@ -77,7 +78,7 @@ model = dict(
                 type='CrossEntropyLoss', use_sigmoid=False, loss_weight=1.0),
             loss_bbox=dict(type='SmoothL1Loss', beta=1.0, loss_weight=1.0)),
         text_super=text_pth,
-        dataset='dota'),
+        dataset=data_type),
     train_cfg=dict(
         rpn=dict(
             assigner=dict(

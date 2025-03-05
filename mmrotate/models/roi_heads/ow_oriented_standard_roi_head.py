@@ -27,7 +27,9 @@ from mmrotate.core import obb2poly, obb2poly_np
 from .adaptive_clustering import * 
 from .offline import *
 from scipy.optimize import linear_sum_assignment
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, DBSCAN
+from sklearn.mixture import GaussianMixture
+from sklearn.metrics import silhouette_score
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
@@ -383,6 +385,7 @@ class OwOrientedStandardRoIHead(RotatedStandardRoIHead):
                     # gt_bboxes[i] = torch.cat((gt_bboxes[i], pseudo_proposal_unknown))
                     gt_labels[i] = torch.cat((gt_labels[i], pseudo_label_unknown))
                                     
+                # pdb.set_trace()
                 sampling_result = self.bbox_sampler.sample(
                     assign_result,
                     proposal_list[i],
@@ -832,9 +835,11 @@ class OwOrientedStandardRoIHead(RotatedStandardRoIHead):
             sum_distance = normalized_l2_distance(text_feature_align, text_features)
             # pdb.set_trace()
                      
+            ori_text_feature_align = text_feature_align.clone()
             text_feature_align = text_feature_align[:self.num_classes - 1, :]
             keep = torch.where(proposal_labels != self.num_classes - 1)[0]
-            uk_input_features = input_features[~keep]
+            uk_keep = torch.where(proposal_labels == self.num_classes - 1)[0]
+            uk_input_features = input_features[uk_keep].clone()
             input_features = input_features[keep]
             proposal_labels = proposal_labels[keep].long()
             input_features = F.normalize(input_features, dim=1)
@@ -842,6 +847,7 @@ class OwOrientedStandardRoIHead(RotatedStandardRoIHead):
             res = torch.matmul(input_features, text_feature_align.transpose(-1, -2))
             _, a, _, _ = bbox_targets
             a = a[:proposal_labels.shape[0]]
+            #pdb.set_trace()
             # 出现nan情况
             if res.shape[0] > 0:
                 loss_text = self.text_loss(
@@ -898,11 +904,90 @@ class OwOrientedStandardRoIHead(RotatedStandardRoIHead):
                 # 8. 平均所有有效样本的损失
                 total_loss = loss_per_sample.sum() / (valid_indices.sum() + eps)
                 return total_loss
+            
+            def gpu_accelerated_clustering(
+                text_features,      # 原始文本特征 [N_text, D]
+                uk_input_features,  # 待分类图像特征 [N_img, D]
+                n_clusters=5, 
+                device="cuda",
+                max_iter=100
+            ):
+                #======================= 数据准备 ========================#
+                # 保持所有数据在GPU上
+                text_features = text_features.to(device)
+                image_features = uk_input_features.to(device)
+                
+                #=================== 动态选择初始原型 ====================#
+                # 选择后n_clusters-1个文本特征作为初始原型
+                selected_centroids = text_features[-n_clusters+1:]  # [4, D]
+                
+                #==================== GPU版K-Means ======================#
+                def pytorch_kmeans(features, initial_centroids, max_iter=100):
+                    centroids = initial_centroids.clone()
+                    for _ in range(max_iter):
+                        # 计算距离矩阵 [N_img, 4]
+                        distances = torch.cdist(features, centroids)
+                        
+                        # 分配簇标签
+                        labels = torch.argmin(distances, dim=1)
+                        
+                        # 更新中心点
+                        new_centroids = torch.stack([
+                            features[labels == k].mean(dim=0) 
+                            for k in range(centroids.size(0))
+                        ])
+                        
+                        # 收敛判断
+                        if torch.allclose(centroids, new_centroids, rtol=1e-4):
+                            break
+                        centroids = new_centroids
+                    return centroids
+
+                # 运行K-Means (仅使用4个初始中心)
+                kmeans_centroids = pytorch_kmeans(
+                    image_features, 
+                    selected_centroids, 
+                    max_iter=max_iter
+                )  # [4, D]
+
+                #=============== 动态生成第五个原型 ==================#
+                # 计算与现有原型的最大间距方向
+                centroid_distances = torch.cdist(kmeans_centroids, kmeans_centroids)
+                # 将 PyTorch 张量转换为 NumPy 数组
+                centroid_distances_np = centroid_distances.detach().cpu().numpy()
+                # 使用 NumPy 的 unravel_index 函数
+                farthest_pair = np.unravel_index(
+                    np.argmax(centroid_distances_np), 
+                    centroid_distances_np.shape
+                )
+                # 将结果转换回 PyTorch 张量
+                farthest_pair = torch.tensor(farthest_pair, dtype=torch.long, device=device)
+                fifth_proto = 0.5 * (
+                    kmeans_centroids[farthest_pair[0]] + 
+                    kmeans_centroids[farthest_pair[1]]
+                )
+                
+                #================= 构建混合高斯模型 ==================#
+                # 合并所有原型 [5, D]
+                all_prototypes = torch.cat([kmeans_centroids, fifth_proto.unsqueeze(0)])
+                
+                # GPU优化版软分配
+                def gmm_assign(features, prototypes, temperature=0.1):
+                    # 计算概率分布 [N_img, 5]
+                    logits = -torch.cdist(features, prototypes) / temperature
+                    return torch.softmax(logits, dim=1)
+                
+                # 获取软分配标签
+                prob_labels = gmm_assign(image_features, all_prototypes)
+                hard_labels = torch.argmax(prob_labels, dim=1)
+                
+                return hard_labels
 
             # 从文本特征中选取前 n_clusters 个向量作为初始聚类中心
             n_clusters = 5
-            if uk_input_features.shape[0] >= n_clusters:
-                selected_centroids = text_features[-n_clusters+1:]
+            unique_rows = torch.unique(uk_input_features, dim=0)
+            if uk_input_features.shape[0] >= n_clusters and len(unique_rows) > 1:
+                selected_centroids = ori_text_feature_align[-n_clusters+1:]
                 # 进行 K-Means 聚类，使用文本特征作为初始聚类中心
                 image_features_np = uk_input_features.detach().cpu().numpy()
                 # 生成一个距离足够远的随机向量
@@ -918,13 +1003,88 @@ class OwOrientedStandardRoIHead(RotatedStandardRoIHead):
                     if total_distance > max_total_distance:
                         max_total_distance = total_distance
                         best_random_vector = random_vector
-                # 合并选择的向量和随机向量
                 initial_centroids = torch.cat([selected_centroids, best_random_vector], dim=0).detach().cpu().numpy()
+                # 合并选择的向量和随机向量
                 kmeans = KMeans(n_clusters=n_clusters, init=initial_centroids, n_init=1)
                 cluster_labels = kmeans.fit_predict(image_features_np)
                 cluster_labels = torch.tensor(cluster_labels, device=text_feature_align.device)
+                # # 使用 DBSCAN 聚类
+                # dbscan = DBSCAN(eps=3, min_samples=2)
+                # labels = dbscan.fit_predict(image_features_np)
+                # # 找出离群点（标签为 -1）
+                # outliers = image_features_np[labels == -1]
+                # if len(outliers) > 0:
+                #     # 选择第一个离群点作为新的原型向量
+                #     best_random_vector = outliers[0]
+                #     # print("第五个原型向量（离群点）:", fifth_proto)
+                #     best_random_vector = torch.from_numpy(best_random_vector).to(device=selected_centroids.device).unsqueeze(0)
+                #     initial_centroids = torch.cat([selected_centroids, best_random_vector], dim=0).detach().cpu().numpy()
+                # else:
+                #     n_clusters = 4
+                #     initial_centroids = selected_centroids.detach().cpu().numpy()
+                # # pdb.set_trace()
+                
+
+                
+                # best_score = -1
+                # best_n_clusters = 1
+                # best_labels = None
+                # for n_clusters in range(1, 6):
+                #     if n_clusters == 1:
+                #         # 当簇数量为 1 时，所有样本都属于同一类
+                #         labels = np.zeros(len(image_features_np))
+                #     else:
+                #         kmeans = KMeans(n_clusters=n_clusters)
+                #         labels = kmeans.fit_predict(image_features_np)
+                    
+                #     if n_clusters > 1:
+                #         # 使用轮廓系数评估聚类效果
+                #         if len(np.unique(labels)) == 1:
+                #             break
+                #             pdb.set_trace()
+                #         score = silhouette_score(image_features_np, labels)
+                #     else:
+                #         # 簇数量为 1 时没有轮廓系数
+                #         score = 0
+                    
+                #     if score > best_score:
+                #         best_score = score
+                #         best_n_clusters = n_clusters
+                #         best_labels = labels
+                # print(n_clusters, labels)
+                # cluster_labels = torch.tensor(best_labels, device=text_feature_align.device)
+                
+                # selected_centroids = text_features[-n_clusters+1:].detach().cpu().numpy()
+                # # 进行 K-Means 聚类，使用文本特征作为初始聚类中心
+                # image_features_np = uk_input_features.detach().cpu().numpy()
+                # # 待分类向量集合 features: [N, D]
+                # kmeans = KMeans(n_clusters=5).fit(image_features_np)
+                # cluster_centers = kmeans.cluster_centers_  # 5个聚类中心
+                # # 将现有4个原型与聚类中心匹配
+                # existing_prototypes = selected_centroids  # 现有4个原型向量
+                # matched_indices = []
+                # for proto in existing_prototypes:
+                #     distances = np.linalg.norm(cluster_centers - proto, axis=1)
+                #     matched_idx = np.argmin(distances)
+                #     matched_indices.append(matched_idx)
+                # # 确定第五个原型
+                # fifth_proto = cluster_centers[np.setdiff1d(range(5), matched_indices)[0]]
+                # # 初始化均值参数
+                # initial_means = np.vstack([existing_prototypes, fifth_proto])
+                # # 创建模型并固定前4个均值
+                # gmm = GaussianMixture(n_components=5, means_init=initial_means)
+                # # gmm.means_[:4] = existing_prototypes  # 固定前4个原型
+                # gmm.fit(image_features_np)
+                # cluster_labels = gmm.predict(image_features_np)
+                # cluster_labels = torch.from_numpy(cluster_labels).to(device=text_feature_align.device)
+                
+                # cluster_labels = gpu_accelerated_clustering(text_features, uk_input_features, 
+                #                                             n_clusters, text_feature_align.device)
                 # pdb.set_trace()
-                loss_nce = info_nce_loss(uk_input_features, cluster_labels, text_feature_align.device)
+                cluster_labels = cluster_labels + 6
+                all_input_features = torch.cat([uk_input_features, input_features], dim=0)
+                all_labels = torch.cat([cluster_labels, proposal_labels], dim=0)
+                loss_nce = info_nce_loss(all_input_features, all_labels, text_feature_align.device)
                 # pdb.set_trace()
             else:
                 loss_nce = torch.tensor(0, device=text_feature_align.device)
@@ -964,7 +1124,7 @@ class OwOrientedStandardRoIHead(RotatedStandardRoIHead):
             
         if self.train_cfg.assigner['text_super'] and res.shape[0] > 0:
             loss_bbox['loss_text'] = loss_text
-            loss_bbox['loss_nce'] = loss_nce * 1.0
+            loss_bbox['loss_nce'] = loss_nce * 0.5
             # loss_bbox['loss_diff'] = sum_abs_diff * 4
             # loss_bbox['loss_distan'] = sum_distance * 0.5
             # loss_bbox['loss_vae'] = loss_vae * 0.01

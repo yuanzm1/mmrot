@@ -20,7 +20,7 @@ model = dict(
         norm_cfg=dict(type='BN', requires_grad=True),
         norm_eval=True,
         style='pytorch',
-        #init_cfg=dict(type='Pretrained', checkpoint='/mnt/disk2/yuanzm/weights/nwpu_ep15.pth', prefix='visual.')),
+        # init_cfg=dict(type='Pretrained', checkpoint='/mnt/disk2/yuanzm/weights/nwpu_ep15.pth', prefix='visual.')),
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     neck=dict(
         type='FPN',
@@ -175,4 +175,4 @@ data = dict(
 
 checkpoint_config = dict(interval=12)
 optimizer = dict(lr=0.005*bs/2) #bs2 一卡 0.005
-# load_from = "/home/yuanzm/mmrotate/work_dirs/ow_oriented_rcnn_r50_fpn_1x_nwpu_le90/base2-epoch12.pth"
+#load_from = "/home/yuanzm/mmrotate/work_dirs/ow_oriented_rcnn_r50_fpn_1x_nwpu_le90/latest.pth"
