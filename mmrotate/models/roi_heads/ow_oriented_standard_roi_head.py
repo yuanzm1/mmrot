@@ -802,6 +802,8 @@ class OwOrientedStandardRoIHead(RotatedStandardRoIHead):
             # 'helicopter', 'tennis_court',  'soccer_ball_field',  'swimming_pool']
             text_features = self.text_feature.to('cuda').transpose(0, 1)
             input_features, proposal_labels, pos_ind = self.obtain_contra_feats(trans_feature, sampling_results)
+            # if self.dataset == 'dota':
+            #     text_features[[3, 12],:]  = text_features[[12,3],:]
                 
             # 保存对齐后的text feature
             # path = 'text_supervised_feature/text_feature_align_text0.02_mlp_from_ckpt.pth'
@@ -834,6 +836,65 @@ class OwOrientedStandardRoIHead(RotatedStandardRoIHead):
                 return torch.norm(diff, p=2)
             sum_distance = normalized_l2_distance(text_feature_align, text_features)
             
+            def sinkhorn_knopp(cost_matrix, epsilon=0.05, num_iters=50):
+                """
+                Sinkhorn-Knopp 算法实现最优传输分配
+                Args:
+                    cost_matrix (Tensor): 代价矩阵 [B, C] (注意这里是负相似度 -S)
+                    epsilon (float): 熵正则化系数
+                    num_iters (int): 迭代次数
+                Returns:
+                    Q (Tensor): 分配矩阵 [B, C]
+                """
+                # 初始化：使用指数缩放后的代价矩阵
+                K = torch.exp(-cost_matrix / epsilon)
+                
+                # 交替行列归一化
+                u = torch.ones(K.shape[0], device=K.device) / K.shape[0]  # 均匀分布约束
+                v = torch.ones(K.shape[1], device=K.device) / K.shape[1]
+                
+                for _ in range(num_iters):
+                    # 行归一化
+                    K = K / u.view(-1, 1)  # [B, C]
+                    K = K / K.sum(dim=1, keepdim=True)  # 行和归一化为1
+                    
+                    # 列归一化
+                    K = K / v.view(1, -1)  # [B, C]
+                    K = K / K.sum(dim=0, keepdim=True)  # 列和归一化为1
+                
+                Q = K * K.shape[0]  # 缩放回原始比例（满足分配约束）
+                return Q
+
+            def compute_unknown_alignment_loss(image_features, text_features, tau=0.07, epsilon=0.05):
+                """
+                计算未知类的对齐损失
+                Args:
+                    image_features (Tensor): 未知类图像特征 [B, D]
+                    text_features (Tensor): 未知类文本特征 [C, D] (C=4)
+                    tau (float): 温度参数
+                    epsilon (float): Sinkhorn正则化系数
+                Returns:
+                    loss (Tensor): 对比损失
+                    Q (Tensor): 分配矩阵 [B, C]
+                """
+                # Step 1: 计算图像-文本相似度矩阵 (余弦相似度)
+                image_features = F.normalize(image_features, p=2, dim=1)  # [B, D]
+                text_features = F.normalize(text_features, p=2, dim=1)  # [C, D]
+                logits = torch.mm(image_features, text_features.t())  # [B, C]
+                
+                # Step 2: 最优传输分配 (将相似度转换为代价矩阵)
+                cost_matrix = -logits  # Sinkhorn输入为代价矩阵，这里用负相似度
+                Q = sinkhorn_knopp(cost_matrix, epsilon=epsilon)  # [B, C]
+                
+                # Step 3: 计算对比损失 (交叉熵形式)
+                logits = logits / tau
+                log_prob = F.log_softmax(logits, dim=1)  # [B, C]
+                
+                # 计算加权交叉熵损失
+                loss = -torch.sum(Q * log_prob) / Q.size(0)
+                
+                return loss, Q
+  
             def select_top3(image_feature, text_feature, similarity, n=3):
                 """
                 选取每类 text_feature 和 image_feature 相似度前 3 高的 image_feature，并生成对应的 label 和相似度概率
@@ -874,9 +935,24 @@ class OwOrientedStandardRoIHead(RotatedStandardRoIHead):
                 labels = torch.tensor(labels)
                 probabilities = torch.tensor(probabilities)
                 return selected_image_features, labels, probabilities
-             
+
+            class FocalLoss(nn.Module):
+                def __init__(self, alpha=None, gamma=2.0):
+                    super().__init__()
+                    self.alpha = alpha  # 可传入类别权重向量 [C]
+                    self.gamma = gamma
+
+                def forward(self, inputs, targets):
+                    ce_loss = F.cross_entropy(inputs, targets, reduction='none')  # [B]
+                    pt = torch.exp(-ce_loss)  # p_t = 1 - ce_loss 的指数形式
+                    focal_loss = (1 - pt) ** self.gamma * ce_loss
+                    if self.alpha is not None:
+                        alpha = self.alpha[targets]  # 按targets选择对应的alpha权重 [B]
+                        focal_loss = alpha * focal_loss
+                    return focal_loss.mean()
+
             ori_text_feature_align = text_feature_align.clone()
-            # uk_text_feature_align = text_feature_align[self.num_classes - 1:, :].clone()
+            uk_text_feature_align = text_feature_align[self.num_classes - 1:, :].clone()
             text_feature_align = text_feature_align[:self.num_classes - 1, :]
             keep = torch.where(proposal_labels != self.num_classes - 1)[0]
             uk_keep = torch.where(proposal_labels == self.num_classes - 1)[0]
@@ -888,31 +964,34 @@ class OwOrientedStandardRoIHead(RotatedStandardRoIHead):
             res = torch.matmul(input_features, text_feature_align.transpose(-1, -2))
             # res_uk = torch.matmul(uk_input_features, uk_text_feature_align.transpose(-1, -2))
             # uk_pse_feature, uk_lbl, _ = select_top3(uk_input_features, uk_text_feature_align, res_uk)
+            # loss_uk_text, _ = compute_unknown_alignment_loss(uk_input_features, uk_text_feature_align)
+            # pdb.set_trace()
             _, a, _, _ = bbox_targets
             a = a[:proposal_labels.shape[0]]
             # pdb.set_trace()
             # 出现nan情况
             if res.shape[0] > 0:
-                loss_text = self.text_loss(
-                        res,
-                        proposal_labels,
-                        a,
-                        avg_factor=proposal_labels.shape[0],
-                        reduction_override=None) * 0.02
-                # loss_text2 = self.text_loss(
-                #                 torch.matmul(F.normalize(uk_pse_feature, dim=1), 
-                #                              F.normalize(uk_text_feature_align, dim=1).transpose(-1, -2)),
-                #                 uk_lbl.to(device=proposal_labels.device)
-                #             ) * 0.02
-                # pdb.set_trace()
+                # loss_text = self.text_loss(
+                #         res,
+                #         proposal_labels,
+                #         a,
+                #         avg_factor=proposal_labels.shape[0],
+                #         reduction_override=None) * 0.02
+                
+                class_counts = torch.tensor([146, 87, 36, 9, 10, 6, 47, 19, 77, 121, 6], device=res.device)  # 已知10类的样本数
+                weights = class_counts.sum() / ((self.num_classes-4) * class_counts.float())
+                weights = weights / weights.sum()  # 归一化权重（可选）
+                # 使用示例
+                alpha_weights = 1.0 / (class_counts + 1e-6)  # 逆频率权重（可调整）
+                alpha_weights = alpha_weights / alpha_weights.sum()  # 归一化
+                focal_loss_fn = FocalLoss(alpha=alpha_weights, gamma=2.0)
+                loss_text = focal_loss_fn(res, proposal_labels)
 
-            # loss_text += sum_abs_diff * 4
             # if res.shape[0] > 0 and (not (0 <= loss_text <=10)):
             #     print(res)
             # loss_text = self.clstr_loss_l2_cdist_new(input_features, proposals)
             
             # 定义对比学习损失函数（InfoNCE 损失）
-
             def info_nce_loss(image_features, labels, device, temperature=0.07, eps=1e-8):
                 """
                 image_features: Tensor of shape [batch_size, feature_dim]
@@ -1051,32 +1130,34 @@ class OwOrientedStandardRoIHead(RotatedStandardRoIHead):
                 #                                             n_clusters, text_feature_align.device)
                 # pdb.set_trace()
 
-                unique_k_labels = torch.unique(proposal_labels)
-                new_feature_list = []
-                new_labels_list = []
-                for unique_label in unique_k_labels:
-                    # 找出属于当前独特类别的索引
-                    indices = torch.nonzero(proposal_labels == unique_label, as_tuple=False).squeeze(-1)
-                    # 选取前3个对应的特征
-                    selected_features = input_features[indices[:3]]
-                    new_feature_list.append(selected_features)
-                    # 生成对应的标签列表，长度与选取的特征数量一致
-                    num_selected = selected_features.shape[0]
-                    label_for_selected = torch.full((num_selected,), unique_label)
-                    new_labels_list.append(label_for_selected)
-                # 将所有选取的特征拼接起来
-                if False:
-                    new_feature = torch.cat(new_feature_list, dim=0).to(device=cluster_labels.device)
-                    # 将所有对应的标签拼接起来
-                    new_labels = torch.cat(new_labels_list, dim=0).to(device=cluster_labels.device)
-                    cluster_labels = cluster_labels + 6
-                    all_input_features = torch.cat([uk_input_features, new_feature], dim=0)
-                    all_labels = torch.cat([cluster_labels, new_labels], dim=0)
-                else:
-                    cluster_labels = cluster_labels + self.num_classes - 1
-                    all_input_features = torch.cat([uk_input_features, input_features], dim=0)
-                    all_labels = torch.cat([cluster_labels, proposal_labels], dim=0)
+                # unique_k_labels = torch.unique(proposal_labels)
+                # new_feature_list = []
+                # new_labels_list = []
+                # for unique_label in unique_k_labels:
+                #     # 找出属于当前独特类别的索引
+                #     indices = torch.nonzero(proposal_labels == unique_label, as_tuple=False).squeeze(-1)
+                #     # 选取前3个对应的特征
+                #     selected_features = input_features[indices[:3]]
+                #     new_feature_list.append(selected_features)
+                #     # 生成对应的标签列表，长度与选取的特征数量一致
+                #     num_selected = selected_features.shape[0]
+                #     label_for_selected = torch.full((num_selected,), unique_label)
+                #     new_labels_list.append(label_for_selected)
+                # # 将所有选取的特征拼接起来
+                # if False:
+                #     new_feature = torch.cat(new_feature_list, dim=0).to(device=cluster_labels.device)
+                #     # 将所有对应的标签拼接起来
+                #     new_labels = torch.cat(new_labels_list, dim=0).to(device=cluster_labels.device)
+                #     cluster_labels = cluster_labels + 6
+                #     all_input_features = torch.cat([uk_input_features, new_feature], dim=0)
+                #     all_labels = torch.cat([cluster_labels, new_labels], dim=0)
+                # else:
+                
+                cluster_labels = cluster_labels + self.num_classes - 1
+                all_input_features = torch.cat([uk_input_features, input_features], dim=0)
+                all_labels = torch.cat([cluster_labels, proposal_labels], dim=0)
                 loss_nce = info_nce_loss(all_input_features, all_labels, text_feature_align.device)
+                # pdb.set_trace()
             else:
                 loss_nce = torch.tensor(0, device=text_feature_align.device)
             #pdb.set_trace()
@@ -1115,9 +1196,9 @@ class OwOrientedStandardRoIHead(RotatedStandardRoIHead):
             
         if self.train_cfg.assigner['text_super'] and res.shape[0] > 0:
             loss_bbox['loss_text'] = loss_text
-            # loss_bbox['loss_uk_text'] = loss_text2
+            # loss_bbox['loss_uk_text'] = loss_uk_text * 0.02
             loss_bbox['loss_nce'] = loss_nce * 0.5
-            #loss_bbox['loss_diff'] = sum_abs_diff * 1 #4 original
+            loss_bbox['loss_diff'] = sum_abs_diff * 1 #4 original
             # loss_bbox['loss_distan'] = sum_distance * 0.5
             # loss_bbox['loss_vae'] = loss_vae * 0.01
         # pdb.set_trace()
