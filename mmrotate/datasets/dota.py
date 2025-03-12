@@ -37,8 +37,10 @@ class DOTADataset(CustomDataset):
 
     # CLASSES = ('large-vehicle', 'swimming-pool', 'helicopter', 'bridge', 'plane', 'ship', 'soccer-ball-field', 'basketball-court', 'unknown')
 
+    # CLASSES = ('plane','ship','storage-tank','baseball-diamond','basketball-court','ground-track-field','harbor','bridge','large-vehicle',
+    #            'small-vehicle','roundabout','unknown') #'helicopter', 'tennis-court',  'soccer-ball-field',  'swimming-pool'
     CLASSES = ('plane','ship','storage-tank','baseball-diamond','basketball-court','ground-track-field','harbor','bridge','large-vehicle',
-               'small-vehicle','roundabout','unknown') #'helicopter', 'tennis-court',  'soccer-ball-field',  'swimming-pool'
+            'small-vehicle','roundabout','unknown') #'helicopter',  'storage-tank', 'soccer-ball-field',  'swimming-pool'
 
     PALETTE = [(165, 42, 42), (189, 183, 107), (0, 255, 0), (255, 0, 0),
                (138, 43, 226), (255, 128, 0), (255, 0, 255), (0, 255, 255),

@@ -52,5 +52,5 @@ data = dict(
         ann_file=data_root + 'ImageSets/Main/test.txt',
         ann_subdir=data_root + 'Annotations/',
         img_prefix=data_root + 'JPEGImages-test/',
-        test_all=True,
+        test_all=False,
         pipeline=test_pipeline))

@@ -416,6 +416,7 @@ class OwOrientedStandardRoIHead(RotatedStandardRoIHead):
             # has_nan = torch.isnan(bbox_targets[pos_inds.type(torch.bool)]).any()
             warnings.warn("This is a warning message", UserWarning)
             bbox_results['loss_bbox']['loss_bbox'] = torch.zeros(1).to('cuda')
+            # 用来画图
             if False:
                 for k in range(len(img_metas)):
                     img_meta = img_metas[k]
@@ -802,8 +803,6 @@ class OwOrientedStandardRoIHead(RotatedStandardRoIHead):
             # 'helicopter', 'tennis_court',  'soccer_ball_field',  'swimming_pool']
             text_features = self.text_feature.to('cuda').transpose(0, 1)
             input_features, proposal_labels, pos_ind = self.obtain_contra_feats(trans_feature, sampling_results)
-            # if self.dataset == 'dota':
-            #     text_features[[3, 12],:]  = text_features[[12,3],:]
                 
             # 保存对齐后的text feature
             # path = 'text_supervised_feature/text_feature_align_text0.02_mlp_from_ckpt.pth'
@@ -811,12 +810,7 @@ class OwOrientedStandardRoIHead(RotatedStandardRoIHead):
             #     torch.save(text_feature_align, path)
                 
                 # a = torch.load(path)
-                
-            # unknown feature的对齐 用处好像不大？
-            # uk_feature = torch.mean(text_feature_align[self.num_classes:,:],dim=0).unsqueeze(0)
-            # text_feature_align = text_feature_align[:self.num_classes - 1, :]
-            # text_feature_align = torch.cat((text_feature_align, uk_feature), dim=0)
-            # proposal_labels = proposal_labels.long()
+
             text_feature_align = self.text_project(text_features)
             text_feature_align = self.text_project3(self.text_project2(text_feature_align)) 
             
@@ -835,106 +829,6 @@ class OwOrientedStandardRoIHead(RotatedStandardRoIHead):
                 # 计算差值向量的 L2 范数，即归一化后的 L2 距离
                 return torch.norm(diff, p=2)
             sum_distance = normalized_l2_distance(text_feature_align, text_features)
-            
-            def sinkhorn_knopp(cost_matrix, epsilon=0.05, num_iters=50):
-                """
-                Sinkhorn-Knopp 算法实现最优传输分配
-                Args:
-                    cost_matrix (Tensor): 代价矩阵 [B, C] (注意这里是负相似度 -S)
-                    epsilon (float): 熵正则化系数
-                    num_iters (int): 迭代次数
-                Returns:
-                    Q (Tensor): 分配矩阵 [B, C]
-                """
-                # 初始化：使用指数缩放后的代价矩阵
-                K = torch.exp(-cost_matrix / epsilon)
-                
-                # 交替行列归一化
-                u = torch.ones(K.shape[0], device=K.device) / K.shape[0]  # 均匀分布约束
-                v = torch.ones(K.shape[1], device=K.device) / K.shape[1]
-                
-                for _ in range(num_iters):
-                    # 行归一化
-                    K = K / u.view(-1, 1)  # [B, C]
-                    K = K / K.sum(dim=1, keepdim=True)  # 行和归一化为1
-                    
-                    # 列归一化
-                    K = K / v.view(1, -1)  # [B, C]
-                    K = K / K.sum(dim=0, keepdim=True)  # 列和归一化为1
-                
-                Q = K * K.shape[0]  # 缩放回原始比例（满足分配约束）
-                return Q
-
-            def compute_unknown_alignment_loss(image_features, text_features, tau=0.07, epsilon=0.05):
-                """
-                计算未知类的对齐损失
-                Args:
-                    image_features (Tensor): 未知类图像特征 [B, D]
-                    text_features (Tensor): 未知类文本特征 [C, D] (C=4)
-                    tau (float): 温度参数
-                    epsilon (float): Sinkhorn正则化系数
-                Returns:
-                    loss (Tensor): 对比损失
-                    Q (Tensor): 分配矩阵 [B, C]
-                """
-                # Step 1: 计算图像-文本相似度矩阵 (余弦相似度)
-                image_features = F.normalize(image_features, p=2, dim=1)  # [B, D]
-                text_features = F.normalize(text_features, p=2, dim=1)  # [C, D]
-                logits = torch.mm(image_features, text_features.t())  # [B, C]
-                
-                # Step 2: 最优传输分配 (将相似度转换为代价矩阵)
-                cost_matrix = -logits  # Sinkhorn输入为代价矩阵，这里用负相似度
-                Q = sinkhorn_knopp(cost_matrix, epsilon=epsilon)  # [B, C]
-                
-                # Step 3: 计算对比损失 (交叉熵形式)
-                logits = logits / tau
-                log_prob = F.log_softmax(logits, dim=1)  # [B, C]
-                
-                # 计算加权交叉熵损失
-                loss = -torch.sum(Q * log_prob) / Q.size(0)
-                
-                return loss, Q
-  
-            def select_top3(image_feature, text_feature, similarity, n=3):
-                """
-                选取每类 text_feature 和 image_feature 相似度前 3 高的 image_feature，并生成对应的 label 和相似度概率
-                :param image_feature: 形状为 [N, 1024] 的图像特征张量
-                :param text_feature: 形状为 [20, 1024] 的文本特征张量
-                :return: 选择的 image_feature 张量、对应的 label 张量和相似度概率张量
-                """
-                num_text_classes = text_feature.shape[0]
-                num_image_features = image_feature.shape[0]
-                # 初始化已选择的图像特征索引集合
-                selected_indices = set()
-                selected_image_features = []
-                labels = []
-                probabilities = []
-
-                for i in range(num_text_classes):
-                    top3_indices = []
-                    top3_probs = []
-                    current_similarity = similarity[i]
-                    sorted_indices = torch.argsort(current_similarity, descending=True)
-
-                    for idx in sorted_indices:
-                        if idx.item() not in selected_indices:
-                            top3_indices.append(idx.item())
-                            top3_probs.append(current_similarity[idx].item())
-                            selected_indices.add(idx.item())
-                        if len(top3_indices) == n:
-                            break
-
-                    for idx, prob in zip(top3_indices, top3_probs):
-                        if idx != -1:
-                            selected_image_features.append(image_feature[idx])
-                            labels.append(i)
-                            probabilities.append(prob)
-
-                # 将选择的 image_feature 转换为张量
-                selected_image_features = torch.stack(selected_image_features) if selected_image_features else torch.tensor([])
-                labels = torch.tensor(labels)
-                probabilities = torch.tensor(probabilities)
-                return selected_image_features, labels, probabilities
 
             class FocalLoss(nn.Module):
                 def __init__(self, alpha=None, gamma=2.0):
@@ -962,13 +856,9 @@ class OwOrientedStandardRoIHead(RotatedStandardRoIHead):
             input_features = F.normalize(input_features, dim=1)
             text_feature_align = F.normalize(text_feature_align, dim=1)
             res = torch.matmul(input_features, text_feature_align.transpose(-1, -2))
-            # res_uk = torch.matmul(uk_input_features, uk_text_feature_align.transpose(-1, -2))
-            # uk_pse_feature, uk_lbl, _ = select_top3(uk_input_features, uk_text_feature_align, res_uk)
-            # loss_uk_text, _ = compute_unknown_alignment_loss(uk_input_features, uk_text_feature_align)
             # pdb.set_trace()
             _, a, _, _ = bbox_targets
             a = a[:proposal_labels.shape[0]]
-            # pdb.set_trace()
             # 出现nan情况
             if res.shape[0] > 0:
                 # loss_text = self.text_loss(
@@ -1058,106 +948,11 @@ class OwOrientedStandardRoIHead(RotatedStandardRoIHead):
                 kmeans = KMeans(n_clusters=n_clusters, init=initial_centroids, n_init=1)
                 cluster_labels = kmeans.fit_predict(image_features_np)
                 cluster_labels = torch.tensor(cluster_labels, device=text_feature_align.device)
-                # # 使用 DBSCAN 聚类
-                # dbscan = DBSCAN(eps=3, min_samples=2)
-                # labels = dbscan.fit_predict(image_features_np)
-                # # 找出离群点（标签为 -1）
-                # outliers = image_features_np[labels == -1]
-                # if len(outliers) > 0:
-                #     # 选择第一个离群点作为新的原型向量
-                #     best_random_vector = outliers[0]
-                #     # print("第五个原型向量（离群点）:", fifth_proto)
-                #     best_random_vector = torch.from_numpy(best_random_vector).to(device=selected_centroids.device).unsqueeze(0)
-                #     initial_centroids = torch.cat([selected_centroids, best_random_vector], dim=0).detach().cpu().numpy()
-                # else:
-                #     n_clusters = 4
-                #     initial_centroids = selected_centroids.detach().cpu().numpy()
-                # # pdb.set_trace()
-                
-                # best_score = -1
-                # best_n_clusters = 1
-                # best_labels = None
-                # for n_clusters in range(1, 6):
-                #     if n_clusters == 1:
-                #         # 当簇数量为 1 时，所有样本都属于同一类
-                #         labels = np.zeros(len(image_features_np))
-                #     else:
-                #         kmeans = KMeans(n_clusters=n_clusters)
-                #         labels = kmeans.fit_predict(image_features_np)
-                    
-                #     if n_clusters > 1:
-                #         # 使用轮廓系数评估聚类效果
-                #         if len(np.unique(labels)) == 1:
-                #             break
-                #             pdb.set_trace()
-                #         score = silhouette_score(image_features_np, labels)
-                #     else:
-                #         # 簇数量为 1 时没有轮廓系数
-                #         score = 0
-                    
-                #     if score > best_score:
-                #         best_score = score
-                #         best_n_clusters = n_clusters
-                #         best_labels = labels
-                # print(n_clusters, labels)
-                # cluster_labels = torch.tensor(best_labels, device=text_feature_align.device)
-                
-                # selected_centroids = text_features[-n_clusters+1:].detach().cpu().numpy()
-                # # 进行 K-Means 聚类，使用文本特征作为初始聚类中心
-                # image_features_np = uk_input_features.detach().cpu().numpy()
-                # # 待分类向量集合 features: [N, D]
-                # kmeans = KMeans(n_clusters=5).fit(image_features_np)
-                # cluster_centers = kmeans.cluster_centers_  # 5个聚类中心
-                # # 将现有4个原型与聚类中心匹配
-                # existing_prototypes = selected_centroids  # 现有4个原型向量
-                # matched_indices = []
-                # for proto in existing_prototypes:
-                #     distances = np.linalg.norm(cluster_centers - proto, axis=1)
-                #     matched_idx = np.argmin(distances)
-                #     matched_indices.append(matched_idx)
-                # # 确定第五个原型
-                # fifth_proto = cluster_centers[np.setdiff1d(range(5), matched_indices)[0]]
-                # # 初始化均值参数
-                # initial_means = np.vstack([existing_prototypes, fifth_proto])
-                # # 创建模型并固定前4个均值
-                # gmm = GaussianMixture(n_components=5, means_init=initial_means)
-                # # gmm.means_[:4] = existing_prototypes  # 固定前4个原型
-                # gmm.fit(image_features_np)
-                # cluster_labels = gmm.predict(image_features_np)
-                # cluster_labels = torch.from_numpy(cluster_labels).to(device=text_feature_align.device)
-                
-                # cluster_labels = gpu_accelerated_clustering(text_features, uk_input_features, 
-                #                                             n_clusters, text_feature_align.device)
-                # pdb.set_trace()
-
-                # unique_k_labels = torch.unique(proposal_labels)
-                # new_feature_list = []
-                # new_labels_list = []
-                # for unique_label in unique_k_labels:
-                #     # 找出属于当前独特类别的索引
-                #     indices = torch.nonzero(proposal_labels == unique_label, as_tuple=False).squeeze(-1)
-                #     # 选取前3个对应的特征
-                #     selected_features = input_features[indices[:3]]
-                #     new_feature_list.append(selected_features)
-                #     # 生成对应的标签列表，长度与选取的特征数量一致
-                #     num_selected = selected_features.shape[0]
-                #     label_for_selected = torch.full((num_selected,), unique_label)
-                #     new_labels_list.append(label_for_selected)
-                # # 将所有选取的特征拼接起来
-                # if False:
-                #     new_feature = torch.cat(new_feature_list, dim=0).to(device=cluster_labels.device)
-                #     # 将所有对应的标签拼接起来
-                #     new_labels = torch.cat(new_labels_list, dim=0).to(device=cluster_labels.device)
-                #     cluster_labels = cluster_labels + 6
-                #     all_input_features = torch.cat([uk_input_features, new_feature], dim=0)
-                #     all_labels = torch.cat([cluster_labels, new_labels], dim=0)
-                # else:
                 
                 cluster_labels = cluster_labels + self.num_classes - 1
                 all_input_features = torch.cat([uk_input_features, input_features], dim=0)
                 all_labels = torch.cat([cluster_labels, proposal_labels], dim=0)
                 loss_nce = info_nce_loss(all_input_features, all_labels, text_feature_align.device)
-                # pdb.set_trace()
             else:
                 loss_nce = torch.tensor(0, device=text_feature_align.device)
             #pdb.set_trace()
@@ -1181,7 +976,7 @@ class OwOrientedStandardRoIHead(RotatedStandardRoIHead):
                 
                 return loss / input_features.shape[0]
             
-            # # 采用VAE进行特征对齐
+            # # 采用VAE进行特征对齐——没效果
             # keep = torch.where(proposal_labels != self.num_classes - 1)[0]
             # input_features = input_features[keep]
             # proposal_labels = proposal_labels[keep].long()    
@@ -1196,7 +991,6 @@ class OwOrientedStandardRoIHead(RotatedStandardRoIHead):
             
         if self.train_cfg.assigner['text_super'] and res.shape[0] > 0:
             loss_bbox['loss_text'] = loss_text
-            # loss_bbox['loss_uk_text'] = loss_uk_text * 0.02
             loss_bbox['loss_nce'] = loss_nce * 0.5
             loss_bbox['loss_diff'] = sum_abs_diff * 1 #4 original
             # loss_bbox['loss_distan'] = sum_distance * 0.5
